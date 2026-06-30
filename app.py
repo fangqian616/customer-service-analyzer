@@ -61,6 +61,67 @@ with st.sidebar:
     max_conv = st.number_input("最大解析会话数", min_value=100, max_value=100000, 
                                 value=20000, step=5000, help="限制解析数量以加快速度")
     encoding = st.selectbox("文件编码", ["utf-8", "gbk", "gb2312", "utf-16"], index=0)
+    
+    st.divider()
+    
+    # ── AI提示词自定义 ──
+    st.subheader("AI提示词配置")
+    
+    # 分析轮次
+    analysis_rounds = st.number_input("分析轮次", min_value=1, max_value=10,
+                                       value=st.session_state.get('analysis_rounds', 1), step=1,
+                                       help="每轮AI会基于上一轮结论深化分析，轮次越多越深入但耗时越长")
+    st.session_state['analysis_rounds'] = analysis_rounds
+    
+    # 分析模块管理
+    st.markdown("**分析模块**")
+    
+    default_modules = [
+        "整体舆情态势",
+        "核心痛点TOP5（每个痛点配3条典型原话）",
+        "产品质量问题汇总",
+        "服务体验问题",
+        "国补/促销政策相关舆情",
+        "情感分布判断",
+        "风险预警",
+        "改进建议",
+    ]
+    
+    if 'custom_modules' not in st.session_state:
+        st.session_state['custom_modules'] = default_modules.copy()
+    
+    # 显示并编辑现有模块
+    modules_to_remove = []
+    for i, mod in enumerate(st.session_state['custom_modules']):
+        col_a, col_b = st.columns([5, 1])
+        with col_a:
+            new_val = st.text_input(f"模块{i+1}", value=mod, key=f"mod_{i}", label_visibility="collapsed")
+            if new_val != mod:
+                st.session_state['custom_modules'][i] = new_val
+        with col_b:
+            if st.button("🗑", key=f"del_mod_{i}", help="删除此模块"):
+                modules_to_remove.append(i)
+    # 删除标记的模块
+    for idx in reversed(modules_to_remove):
+        st.session_state['custom_modules'].pop(idx)
+        st.rerun()
+    
+    # 新增模块
+    new_module = st.text_input("新增模块名称", key="new_module_input", placeholder="输入后按回车添加")
+    if new_module and new_module not in st.session_state['custom_modules']:
+        st.session_state['custom_modules'].append(new_module)
+        st.rerun()
+    
+    # 额外指令
+    extra_instructions = st.text_area("额外指令", value=st.session_state.get('extra_instructions', ''), height=80,
+                                       placeholder="如：重点关注冰箱品类、需对比上月数据、强调售后流程问题...",
+                                       help="追加到提示词末尾的额外要求，会指导AI的分析方向")
+    st.session_state['extra_instructions'] = extra_instructions
+    
+    # 恢复默认
+    if st.button("恢复默认模块"):
+        st.session_state['custom_modules'] = default_modules.copy()
+        st.rerun()
 
 # ── 主区域 ──
 st.markdown('<p class="main-title">📊 客服聊天记录舆情分析系统</p>', unsafe_allow_html=True)
@@ -340,7 +401,12 @@ if uploaded_file is not None:
                 with st.spinner("正在调用AI分析..."):
                     try:
                         # 调用DeepSeek API
-                        ai_text = _call_deepseek(deepseek_key, deepseek_base, parsed, summary)
+                        ai_text = _call_deepseek(
+                            deepseek_key, deepseek_base, parsed, summary,
+                            custom_modules=st.session_state.get('custom_modules'),
+                            analysis_rounds=st.session_state.get('analysis_rounds', 1),
+                            extra_instructions=st.session_state.get('extra_instructions', '')
+                        )
                         
                         pdf_tmp = tempfile.mktemp(suffix='.pdf')
                         generate_pdf_report(parsed, pdf_tmp, ai_report_text=ai_text)
@@ -385,8 +451,8 @@ else:
         """)
 
 
-def _call_deepseek(api_key, api_base, parsed_data, summary):
-    """调用DeepSeek API生成分析文本"""
+def _call_deepseek(api_key, api_base, parsed_data, summary, custom_modules=None, analysis_rounds=1, extra_instructions=""):
+    """调用DeepSeek API生成分析文本，支持自定义模块、多轮分析和额外指令"""
     import requests
     
     keyword_counts = parsed_data['keyword_counts']
@@ -400,6 +466,31 @@ def _call_deepseek(api_key, api_base, parsed_data, summary):
         for msg in conv[:6]:
             role = "客服" if msg['role'] == 'agent' else "客户"
             sample_str += f"[{msg.get('date', '')}] {role}: {msg['content']}\n"
+    
+    # 构建模块列表
+    if not custom_modules:
+        custom_modules = [
+            "整体舆情态势",
+            "核心痛点TOP5（每个痛点配3条典型原话）",
+            "产品质量问题汇总",
+            "服务体验问题",
+            "国补/促销政策相关舆情",
+            "情感分布判断",
+            "风险预警",
+            "改进建议",
+        ]
+    
+    modules_text = "\n".join(f"### {i+1}. {mod}" for i, mod in enumerate(custom_modules))
+    
+    # 轮次说明
+    round_instruction = ""
+    if analysis_rounds > 1:
+        round_instruction = f"\n\n【多轮分析要求】共需进行{analysis_rounds}轮分析。每轮在前一轮结论基础上深化，第1轮为初步分析，后续轮次需指出前轮的不足并补充新视角。最终输出合并所有轮次的综合结论。"
+    
+    # 额外指令
+    extra_text = ""
+    if extra_instructions.strip():
+        extra_text = f"\n\n【额外要求】{extra_instructions.strip()}"
     
     prompt = f"""你是数据分析专家，基于以下京东客服聊天记录数据生成舆情分析报告。直接输出报告正文，不要自我介绍，不要写"DeepSeek AI"。
 
@@ -415,29 +506,35 @@ def _call_deepseek(api_key, api_base, parsed_data, summary):
 负面对话样本:
 {sample_str}
 
-请输出8个模块的分析：
-### 1. 整体舆情态势
-### 2. 核心痛点TOP5（每个痛点配3条典型原话）
-### 3. 产品质量问题汇总
-### 4. 服务体验问题
-### 5. 国补/促销政策相关舆情
-### 6. 情感分布判断
-### 7. 风险预警
-### 8. 改进建议"""
+请输出{len(custom_modules)}个模块的分析：
+{modules_text}
+{round_instruction}{extra_text}"""
 
-    resp = requests.post(
-        f"{api_base}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": "deepseek-chat",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7,
-            "max_tokens": 4000,
-        },
-        timeout=120
-    )
+    messages = [{"role": "user", "content": prompt}]
     
-    if resp.status_code == 200:
-        return resp.json()['choices'][0]['message']['content']
-    else:
-        raise Exception(f"API调用失败: {resp.status_code} - {resp.text}")
+    # 多轮分析
+    for round_idx in range(analysis_rounds):
+        if round_idx > 0:
+            deepen_prompt = f"请基于你上一轮的分析结论，进行第{round_idx+1}轮深化分析。要求：①指出前轮分析的不足或遗漏 ②补充新的数据视角或跨维度关联 ③更新风险判断和结论。保持原有模块结构，输出完整深化版报告。"
+            messages.append({"role": "user", "content": deepen_prompt})
+        
+        resp = requests.post(
+            f"{api_base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "deepseek-chat",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 4000,
+            },
+            timeout=120,
+        )
+        
+        if resp.status_code != 200:
+            raise Exception(f"API调用失败(第{round_idx+1}轮): {resp.status_code} - {resp.text}")
+        ai_reply = resp.json()['choices'][0]['message']['content']
+        messages.append({"role": "assistant", "content": ai_reply})
+    
+    if analysis_rounds > 1:
+        return f"（经{analysis_rounds}轮深化分析）\n\n{ai_reply}"
+    return ai_reply
